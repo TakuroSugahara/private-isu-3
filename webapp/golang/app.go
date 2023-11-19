@@ -1,6 +1,8 @@
 package main
 
 import (
+  "encoding/binary"
+  "bytes"
 	crand "crypto/rand"
 	"fmt"
 	"html/template"
@@ -28,6 +30,7 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+  memcacheClient *memcache.Client
 )
 
 const (
@@ -72,7 +75,7 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -172,21 +175,55 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+type CommentCount struct {
+   Value int
+}
+
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+    // cacheにcomment数があれば使う
+    cachedCommentsCountKey := fmt.Sprintf("comments.%d.count", p.ID)
+    cachedCommentsCountBinary, err2 := memcacheClient.Get(cachedCommentsCountKey)
+    if err2 != nil {
+      fmt.Println("cannot cache key")
+      // fmt.Println(err2)
+      // return nil, err2
+    }
+
+    var commentCount int
+    if cachedCommentsCountBinary == nil {
+      err2 := db.Get(&commentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+      if err2 != nil {
+        fmt.Println("cannot get query")
+        fmt.Println(err2)
+        return nil, err2
+      }
+
+      // memcacheに構造体でcommentCountを追加
+      b := CommentCount{Value: commentCount}
+      // バッファを作成
+      buf := new(bytes.Buffer)
+      binary.Write(buf, binary.LittleEndian, &b)
+
+      // 取得語、cacheに保存 
+      memcacheClient.Set(&memcache.Item{Key: cachedCommentsCountKey, Value: buf.Bytes()})
+    } else {
+      a := CommentCount{}
+      reader := bytes.NewReader(cachedCommentsCountBinary.Value)
+      binary.Read(reader, binary.LittleEndian, &a)
+      commentCount = a.Value
+    }
+
+    p.CommentCount = commentCount
 
 		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
 		if !allComments {
 			query += " LIMIT 3"
 		}
 		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+		err := db.Select(&comments, query, p.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -774,6 +811,11 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+
+  cachedCommentsCountKey := fmt.Sprintf("comments.%d.count", postID)
+  if err := memcacheClient.Delete(cachedCommentsCountKey); err != nil {
+    return 
+  }
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
