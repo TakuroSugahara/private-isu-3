@@ -208,7 +208,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
       binary.Write(buf, binary.LittleEndian, &b)
 
       // 取得語、cacheに保存 
-      memcacheClient.Set(&memcache.Item{Key: cachedCommentsCountKey, Value: buf.Bytes()})
+      memcacheClient.Set(&memcache.Item{Key: cachedCommentsCountKey, Value: buf.Bytes(), Expiration: 10})
     } else {
       a := CommentCount{}
       reader := bytes.NewReader(cachedCommentsCountBinary.Value)
@@ -218,14 +218,29 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
     p.CommentCount = commentCount
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
 		var comments []Comment
-		err := db.Select(&comments, query, p.ID)
+
+		cachedCommentsKey := fmt.Sprintf("comments.%d.%t", p.ID, allComments)
+		cachedCommentsBinary, err := memcacheClient.Get(cachedCommentsKey)
 		if err != nil {
-			return nil, err
+			fmt.Println("cannot cache key: %s", cachedCommentsKey)
+		}
+
+		if cachedCommentsBinary == nil {
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+			if !allComments {
+				query += " LIMIT 3"
+			}
+			err := db.Select(&comments, query, p.ID)
+			if err != nil {
+				return nil, err
+			}
+			buf := new(bytes.Buffer)
+			binary.Write(buf, binary.LittleEndian, &comments)
+			memcacheClient.Set(&memcache.Item{Key: cachedCommentsKey, Value: buf.Bytes(), Expiration: 10})
+		} else {
+			reader := bytes.NewReader(cachedCommentsBinary.Value)
+			binary.Read(reader, binary.LittleEndian, &comments)
 		}
 
 		for i := 0; i < len(comments); i++ {
@@ -813,9 +828,17 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 
   cachedCommentsCountKey := fmt.Sprintf("comments.%d.count", postID)
-  if err := memcacheClient.Delete(cachedCommentsCountKey); err != nil {
-    return 
+  if err := memcacheClient.Delete(cachedCommentsCountKey); err != nil && err.Error() != "memcache: cache miss" {
+    return
   }
+  cachedCommentsKeyAll := fmt.Sprintf("comments.%d.%t", postID, true)
+	if err := memcacheClient.Delete(cachedCommentsKeyAll); err != nil && err.Error() != "memcache: cache miss" {
+		return
+	}
+	cachedCommentsKeyThree := fmt.Sprintf("comments.%d.%t", postID, false)
+	if err := memcacheClient.Delete(cachedCommentsKeyThree); err != nil && err.Error() != "memcache: cache miss" {
+		return
+	}
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
