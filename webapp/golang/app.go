@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"os/exec"
 	"path"
 	"regexp"
@@ -53,7 +54,7 @@ type Post struct {
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
-	User         User
+	User         User      `db:"u"`
 	CSRFToken    string
 }
 
@@ -204,19 +205,9 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
@@ -386,7 +377,9 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	err := db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at, "  +
+  "u.id as \"u.id\", u.account_name as \"u.account_name\", u.passhash as \"u.passhash\", u.authority as \"u.authority\", u.del_flg as \"u.del_flg\", u.created_at as \"u.created_at\"" +
+  " FROM `posts` as p  join `users` as u on (p.user_id = u.id) where u.del_flg = 0 order by p.created_at desc limit 20")
 	if err != nil {
 		log.Print(err)
 		return
@@ -432,7 +425,8 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	// err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 20", user.ID)
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at FROM `posts` AS p JOIN `users` AS u ON (p.user_id = u.id) WHERE u.del_flg = 0 AND p.user_id = ? ORDER BY p.created_at DESC LIMIT 20", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -520,7 +514,8 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	// err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC LIMIT 20", t.Format(ISO8601Format))
+	err = db.Select(&results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at FROM `posts` AS p JOIN `users` AS u ON (p.user_id = u.id) WHERE u.del_flg = 0 AND p.created_at <= ? ORDER BY p.created_at DESC LIMIT 20", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
@@ -556,7 +551,10 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+
+  // err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+  err = db.Select(&results, "SELECT p.* FROM `posts` AS p JOIN `users` AS u ON (p.user_id = u.id) WHERE u.del_flg = 0 AND p.id = ?", pid)
+
 	if err != nil {
 		log.Print(err)
 		return
@@ -614,15 +612,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mime := ""
+	ext := ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
+			ext = "jpg"
 		} else if strings.Contains(contentType, "png") {
 			mime = "image/png"
+			ext = "png"
 		} else if strings.Contains(contentType, "gif") {
 			mime = "image/gif"
+			ext = "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -649,6 +651,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	// query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
@@ -667,6 +670,32 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// アップロードされたテンポラリファイルをIMG_DIRに直接移動
+	imgDir := "../public/image" // IMAGE_DIR に相当
+	imgFilePath := filepath.Join(imgDir, fmt.Sprintf("%d.%s", pid, ext))
+
+	f, err := os.Create(imgFilePath)
+	if err != nil {
+		fmt.Println("cannot open the file")
+		return
+	}
+	defer f.Close()
+
+	_, err = f.Write(filedata)
+	if err != nil {
+		fmt.Println(err)
+		fmt.Println("fail to write file")
+		return
+	}
+
+	// ファイルのパーミッションを設定
+	err = os.Chmod(imgFilePath, 0644)
+	if err != nil {
+		// エラー処理
+		fmt.Println(err)
+		fmt.Println("fail permission")
+		return
+	}
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -696,6 +725,25 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
+
+		imgDir := "../public/image" // IMAGE_DIR に相当
+		imgFilePath := filepath.Join(imgDir, fmt.Sprintf("%d.%s", pid, ext))
+		f, err := os.Create(imgFilePath)
+		if err != nil {
+			fmt.Println("#### Start cannot open the file")
+			fmt.Println(pid, ext, fmt.Sprintf("%d.%s", pid, ext))
+			fmt.Println(imgFilePath)
+			fmt.Println(err)
+			fmt.Println("#### End cannot open the file")
+		}
+		defer f.Close()
+
+		_, err = f.Write(post.Imgdata)
+		if err != nil {
+			fmt.Println(err)
+			fmt.Println("fail to write file")
+		}
+
 		return
 	}
 
